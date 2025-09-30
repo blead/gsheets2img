@@ -3,9 +3,9 @@ import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { basename, dirname, extname, join, normalize } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
-import { finished } from 'node:stream/promises';
+import { pipeline } from 'node:stream/promises';
 import config from 'config';
-import decompress from 'decompress';
+import yauzl from 'yauzl-promise';
 import { firefox } from 'playwright';
 
 
@@ -13,13 +13,31 @@ async function download(sheetID) {
   const dir = await mkdtemp(join(tmpdir(), 'gs2imgz-'));
   const zipPath = join(dir, sheetID + '.zip');
   const res = await fetch(`https://docs.google.com/spreadsheets/d/${sheetID}/export?format=zip`);
-  await finished(Readable.fromWeb(res.body).pipe(createWriteStream(zipPath)));
+  await pipeline(Readable.fromWeb(res.body), createWriteStream(zipPath));
   return zipPath;
 }
 
 async function unzip(zipPath) {
   const extractedDir = await mkdtemp(join(tmpdir(), 'gs2imgx-'));
-  await decompress(zipPath, extractedDir);
+  const zip = await yauzl.open(zipPath);
+
+  try {
+    for await (const entry of zip) {
+      const targetPath = join(extractedDir, entry.filename);
+      if (entry.filename.endsWith('/')) {
+        // directory
+        await mkdir(targetPath, { recursive: true });
+      } else {
+        // file
+        const readStream = await entry.openReadStream();
+        await mkdir(dirname(targetPath), { recursive: true });
+        await pipeline(readStream, createWriteStream(targetPath));
+      }
+    }
+  } finally {
+    await zip.close();
+  }
+
   await rm(dirname(zipPath), { force: true, recursive: true });
   return extractedDir;
 }
@@ -28,16 +46,29 @@ async function screenshot(htmlPath, pngPath, browser) {
   const page = await browser.newPage({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 2 });
   await page.goto('file://' + htmlPath, { timeout: 0 });
 
-  const rowHeader = await page.$('.row-header-wrapper');
-  const { width: rowHeaderWidth } = await rowHeader.boundingBox();
-  const tbody = await page.$('tbody');
-  const boundingBox = await tbody.boundingBox();
-  await page.setViewportSize({ width: Math.ceil(boundingBox.width) + 10, height: Math.ceil(boundingBox.height) + 10 });
+  try {
+    const rowHeader = await page.$('.row-header-wrapper');
+    const { width: rowHeaderWidth } = await rowHeader.boundingBox();
+    const tbody = await page.$('tbody');
+    const boundingBox = await tbody.boundingBox();
+    const clipArea = {
+      x: boundingBox.x + rowHeaderWidth + 1,
+      y: boundingBox.y,
+      width: boundingBox.width - rowHeaderWidth - 1,
+      height: boundingBox.height,
+    };
+    
+    await page.setViewportSize({
+      width: Math.max(1920, Math.floor(clipArea.width) + 100),
+      height: Math.max(1080, Math.floor(clipArea.height) + 100),
+    });
 
-  boundingBox.x += rowHeaderWidth + 1;
-  boundingBox.width -= rowHeaderWidth + 1;
-  await page.screenshot({ path: pngPath, clip: boundingBox });
-  await page.close();
+    await page.screenshot({ path: pngPath, clip: clipArea });
+  } catch (e) {
+    console.error(e);
+  } finally {
+    await page.close();
+  }
 }
 
 download(config.get('gsheets2img.sheetID'))
